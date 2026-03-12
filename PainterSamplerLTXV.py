@@ -27,7 +27,7 @@ class PainterSamplerLTXV(io.ComfyNode):
                 io.Combo.Input("scheduler", options=comfy.samplers.KSampler.SCHEDULERS),
                 io.Conditioning.Input("positive"),
                 io.Conditioning.Input("negative"),
-                io.Latent.Input("latent_image"),
+                io.Latent.Input("latent_image", optional=True),
                 io.Latent.Input("video_latent", optional=True),
                 io.Latent.Input("audio_latent", optional=True),
                 io.Int.Input("start_at_step", default=0, min=0, max=10000),
@@ -44,7 +44,7 @@ class PainterSamplerLTXV(io.ComfyNode):
 
     @classmethod
     def execute(cls, model, add_noise, noise_seed, steps, cfg, sampler_name, scheduler, positive, negative, 
-                latent_image, start_at_step, end_at_step, return_noise, video_latent=None, audio_latent=None, sigmas=None) -> io.NodeOutput:
+                latent_image=None, start_at_step=0, end_at_step=10000, return_noise="disable", video_latent=None, audio_latent=None, sigmas=None) -> io.NodeOutput:
         
         force_full_denoise = True
         if return_noise == "enable":
@@ -75,6 +75,9 @@ class PainterSamplerLTXV(io.ComfyNode):
                     if audio_mask is None:
                         audio_mask = torch.ones_like(audio_samples)
                     input_latent["noise_mask"] = comfy.nested_tensor.NestedTensor((video_mask, audio_mask))
+
+        if input_latent is None:
+            raise ValueError("At least one latent input must be provided (latent_image, or both video_latent and audio_latent)")
 
         latent_image_tensor = input_latent["samples"]
         latent_image_tensor = comfy.sample.fix_empty_latent_channels(model, latent_image_tensor)
