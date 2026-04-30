@@ -17,6 +17,8 @@ class PainterLongVideo:
                 "batch_size": ("INT", {"default": 1, "min": 1, "max": 4096}),
                 "motion_frames": ("INT", {"default": 5, "min": 1, "max": 20}),
                 "motion_amplitude": ("FLOAT", {"default": 1.15, "min": 1.0, "max": 2.0, "step": 0.05}),
+                "color_protect": ("BOOLEAN", {"default": True}),
+                "correct_strength": ("FLOAT", {"default": 0.01, "min": 0.0, "max": 0.3, "step": 0.01}),
             },
             "optional": {
                 "previous_video": ("IMAGE",),
@@ -43,6 +45,8 @@ class PainterLongVideo:
         batch_size,
         motion_frames,
         motion_amplitude=1.15,
+        color_protect=True,
+        correct_strength=0.01,
         previous_video=None,
         initial_reference_image=None,
         clip_vision_output=None,
@@ -121,6 +125,8 @@ class PainterLongVideo:
                               device=device, dtype=last_frame_resized.dtype)
             mask[:, :, 0] = 0.0
 
+            concat_latent_image_original = concat_latent_image.clone()
+
             if motion_amplitude > 1.0:
                 base_latent = concat_latent_image[:, :, 0:1]
                 gray_latent = concat_latent_image[:, :, 1:]
@@ -130,6 +136,39 @@ class PainterLongVideo:
                 scaled_latent = base_latent + diff_centered * motion_amplitude + diff_mean
                 scaled_latent = torch.clamp(scaled_latent, -6, 6)
                 concat_latent_image = torch.cat([base_latent, scaled_latent], dim=2)
+
+                if color_protect and correct_strength > 0:
+                    orig_mean = concat_latent_image_original.mean(dim=(2, 3, 4))
+                    enhanced_mean = concat_latent_image.mean(dim=(2, 3, 4))
+
+                    mean_drift = torch.abs(enhanced_mean - orig_mean) / (torch.abs(orig_mean) + 1e-6)
+                    problem_channels = mean_drift > 0.18
+
+                    if problem_channels.any():
+                        drift_amount = enhanced_mean - orig_mean
+                        correction = drift_amount * problem_channels.float() * correct_strength * 0.03
+
+                        for b in range(batch_size):
+                            for c in range(16):
+                                if correction[b, c].abs() > 0:
+                                    concat_latent_image[b, c] = torch.where(
+                                        concat_latent_image[b, c] > 0,
+                                        concat_latent_image[b, c] - correction[b, c],
+                                        concat_latent_image[b, c]
+                                    )
+
+                    orig_brightness = concat_latent_image_original.mean()
+                    enhanced_brightness = concat_latent_image.mean()
+
+                    if enhanced_brightness < orig_brightness * 0.92:
+                        brightness_boost = min(orig_brightness / (enhanced_brightness + 1e-6), 1.05)
+                        concat_latent_image = torch.where(
+                            concat_latent_image < 0.5,
+                            concat_latent_image * brightness_boost,
+                            concat_latent_image
+                        )
+
+                    concat_latent_image = torch.clamp(concat_latent_image, -6, 6)
 
             ref_motion = previous_video[-motion_frames:].clone()
             if ref_motion.shape[0] > 73:
