@@ -95,9 +95,6 @@ class PainterLongVideo:
             concat_latent_image = vae.encode(image[:, :, :, :3])
             mask = mask.view(1, mask.shape[2] // 4, 4, mask.shape[3], mask.shape[4]).transpose(1, 2)
 
-            # motion_amplitude is intentionally not applied in this branch — start/end
-            # frames already constrain the latent at both ends, so there is no gray
-            # latent region to amplify the way the pure-continuation branch does.
             ref_motion_latent = None
             if has_prev and previous_video.shape[0] >= 2:
                 ref_motion = previous_video[-min(73, previous_video.shape[0]):].clone()
@@ -112,44 +109,39 @@ class PainterLongVideo:
                 ref_motion_latent = ref_motion_latent_temp[:, :, -19:]
 
         else:
-            n_anchor = max(1, min(motion_frames, previous_video.shape[0], length))
-            anchor_frames = previous_video[-n_anchor:].clone()
-            anchor_resized = comfy.utils.common_upscale(
-                anchor_frames.movedim(-1, 1), width, height, "bilinear", "center"
+            last_frame = previous_video[-1:].clone()
+            last_frame_resized = comfy.utils.common_upscale(
+                last_frame.movedim(-1, 1), width, height, "bilinear", "center"
             ).movedim(1, -1)
 
             image_seq = torch.full(
-                (length, height, width, anchor_resized.shape[-1]),
-                0.5, device=anchor_resized.device, dtype=anchor_resized.dtype
+                (length, height, width, last_frame_resized.shape[-1]),
+                0.5, device=last_frame_resized.device, dtype=last_frame_resized.dtype
             )
-            image_seq[:n_anchor] = anchor_resized
+            image_seq[0] = last_frame_resized[0]
             concat_latent_image = vae.encode(image_seq[:, :, :, :3])
 
-            # Latent frame 0 covers pixel frame 0; each subsequent latent frame covers
-            # 4 pixel frames. Round up so any partially-anchored latent frame is fully
-            # constrained.
-            n_anchor_latent = min(latent_timesteps, 1 + (n_anchor + 2) // 4)
-
             mask = torch.ones((1, 1, latent_timesteps, height // 8, width // 8),
-                              device=device, dtype=anchor_resized.dtype)
-            mask[:, :, :n_anchor_latent] = 0.0
+                              device=device, dtype=last_frame_resized.dtype)
+            mask[:, :, 0] = 0.0
 
             concat_latent_image_original = concat_latent_image.clone()
 
-            if motion_amplitude > 1.0 and n_anchor_latent < latent_timesteps:
-                base_latent = concat_latent_image[:, :, :n_anchor_latent]
-                gray_latent = concat_latent_image[:, :, n_anchor_latent:]
-                ref_for_diff = base_latent[:, :, -1:]
-                diff = gray_latent - ref_for_diff
+            if motion_amplitude > 1.0:
+                base_latent = concat_latent_image[:, :, 0:1]
+                gray_latent = concat_latent_image[:, :, 1:]
+                diff = gray_latent - base_latent
                 diff_mean = diff.mean(dim=(1, 3, 4), keepdim=True)
                 diff_centered = diff - diff_mean
-                scaled_latent = ref_for_diff + diff_centered * motion_amplitude + diff_mean
+                scaled_latent = base_latent + diff_centered * motion_amplitude + diff_mean
                 scaled_latent = torch.clamp(scaled_latent, -6, 6)
                 concat_latent_image = torch.cat([base_latent, scaled_latent], dim=2)
 
+                post_enhanced = concat_latent_image.clone()
+
                 if color_protect and correct_strength > 0:
                     orig_mean = concat_latent_image_original.mean(dim=(2, 3, 4))
-                    enhanced_mean = concat_latent_image.mean(dim=(2, 3, 4))
+                    enhanced_mean = post_enhanced.mean(dim=(2, 3, 4))
 
                     mean_drift = torch.abs(enhanced_mean - orig_mean) / (torch.abs(orig_mean) + 1e-6)
                     problem_channels = mean_drift > 0.18
@@ -161,26 +153,28 @@ class PainterLongVideo:
                         for b in range(batch_size):
                             for c in range(16):
                                 if correction[b, c].abs() > 0:
-                                    concat_latent_image[b, c] = torch.where(
-                                        concat_latent_image[b, c] > 0,
-                                        concat_latent_image[b, c] - correction[b, c],
-                                        concat_latent_image[b, c]
+                                    post_enhanced[b, c] = torch.where(
+                                        post_enhanced[b, c] > 0,
+                                        post_enhanced[b, c] - correction[b, c],
+                                        post_enhanced[b, c]
                                     )
 
                     orig_brightness = concat_latent_image_original.mean()
-                    enhanced_brightness = concat_latent_image.mean()
+                    enhanced_brightness = post_enhanced.mean()
 
                     if enhanced_brightness < orig_brightness * 0.92:
                         brightness_boost = min(orig_brightness / (enhanced_brightness + 1e-6), 1.05)
-                        concat_latent_image = torch.where(
-                            concat_latent_image < 0.5,
-                            concat_latent_image * brightness_boost,
-                            concat_latent_image
+                        post_enhanced = torch.where(
+                            post_enhanced < 0.5,
+                            post_enhanced * brightness_boost,
+                            post_enhanced
                         )
 
-                    concat_latent_image = torch.clamp(concat_latent_image, -6, 6)
+                    concat_latent_image = torch.clamp(post_enhanced, -6, 6)
 
-            ref_motion = previous_video[-min(73, previous_video.shape[0]):].clone()
+            ref_motion = previous_video[-motion_frames:].clone()
+            if ref_motion.shape[0] > 73:
+                ref_motion = ref_motion[-73:]
             ref_motion_resized = comfy.utils.common_upscale(
                 ref_motion.movedim(-1, 1), width, height, "bilinear", "center"
             ).movedim(1, -1)
